@@ -47,4 +47,7 @@ ane_*.log
 tests/dev/segmented_results/*
 tests/dev/segment_analysis/*
 tests/dev/_runs/
-tests/dev/MLXSpeedTest/
+tests/dev/MLXSpeedTest/turin/models
+artemis_results.json
+turin/ios-app/.build/
+turin/ios-app/results/

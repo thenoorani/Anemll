@@ -53,14 +53,25 @@ public actor ModelLoader {
         public let allowLowPrecision: Bool
         public let memoryLimit: UInt64?
         public let functionName: String?
+        /// Turin bench: compute units for the single-token "infer" function only (nil = computeUnits),
+        /// so prefill can run on one engine and decode on another, sharing the KV state.
+        public let inferComputeUnits: MLComputeUnits?
+        /// Turin bench (headroom test 4): folder holding single-function compiled FFN models
+        /// (<prefix>_FFN_lutN_chunk_XXofYY.mlmodelc for infer, <prefix>_prefill_lutN_... for prefill).
+        /// When set, they are loaded with functionName = nil instead of the multi-function FFN_PF file.
+        public let splitFFNDir: String?
         
         public init(
             computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
             //computeUnits: MLComputeUnits = .cpuOnly,
             allowLowPrecision: Bool = false,
             memoryLimit: UInt64? = nil,
-            functionName: String? = nil
+            functionName: String? = nil,
+            inferComputeUnits: MLComputeUnits? = nil,
+            splitFFNDir: String? = nil
         ) {
+            self.inferComputeUnits = inferComputeUnits
+            self.splitFFNDir = splitFFNDir
             self.computeUnits = computeUnits
             self.allowLowPrecision = allowLowPrecision
             self.memoryLimit = memoryLimit
@@ -341,8 +352,18 @@ public actor ModelLoader {
                 // Multi-function model: load infer and prefill functions separately.
                 print("Loading inference chunk \(i): \(chunkPath)")
                 modelConfig.functionName = "infer"
+                var inferURL = ffnURL, prefillURL = ffnURL
+                if let dir = configurationCopy.splitFFNDir {
+                    let name = ffnURL.lastPathComponent
+                    inferURL = URL(fileURLWithPath: dir).appendingPathComponent(name.replacingOccurrences(of: "_FFN_PF_", with: "_FFN_"))
+                    prefillURL = URL(fileURLWithPath: dir).appendingPathComponent(name.replacingOccurrences(of: "_FFN_PF_", with: "_prefill_"))
+                    print("Split FFN: infer \(inferURL.lastPathComponent), prefill \(prefillURL.lastPathComponent)")
+                }
                 do {
-                    inferModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
+                    let inferConfig = modelConfig.copy() as! MLModelConfiguration
+                    if let u = configurationCopy.inferComputeUnits { inferConfig.computeUnits = u }
+                    if configurationCopy.splitFFNDir != nil { inferConfig.functionName = nil }
+                    inferModel = try ModelLoader.loadMLModel(at: inferURL, configuration: inferConfig)
                     print("✅ Inference chunk \(i) loaded")
                 } catch {
                     print("❌ Error loading inference chunk \(i): \(error)")
@@ -364,7 +385,9 @@ public actor ModelLoader {
                 print("Loading prefill chunk \(i): \(chunkPath)")
                 modelConfig.functionName = "prefill"
                 do {
-                    prefillModel = try ModelLoader.loadMLModel(at: ffnURL, configuration: modelConfig)
+                    let prefillConfig = modelConfig.copy() as! MLModelConfiguration
+                    if configurationCopy.splitFFNDir != nil { prefillConfig.functionName = nil }
+                    prefillModel = try ModelLoader.loadMLModel(at: prefillURL, configuration: prefillConfig)
                     print("✅ Prefill chunk \(i) loaded")
                 } catch {
                     print("❌ Error loading prefill chunk \(i): \(error)")

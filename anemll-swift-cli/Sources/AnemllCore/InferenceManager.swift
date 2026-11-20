@@ -1611,7 +1611,8 @@ private typealias Float16 = Float
     public func runPrefill(
         on contextTokens: inout [Int],
         contextPos: Int,
-        tokenizer: Tokenizer? = nil
+        tokenizer: Tokenizer? = nil,
+        startPos: Int = 0   // Turin bench: continue a conversation without re-prefilling the KV cache
     ) async throws -> Int {
         if debugLevel >= 1 {
             print("\n=== Starting Prefill Phase ===")
@@ -1628,11 +1629,12 @@ private typealias Float16 = Float
         if isMonolithic {
             return try await runMonolithicPrefill(on: &contextTokens, contextPos: contextPos, tokenizer: tokenizer)
         }
-        var batchPos = 0
+        var batchPos = startPos
 
         // Process FULL batches only with prefill model (to avoid padding issues that corrupt KV cache)
         while batchPos + batchSize <= contextPos {
             let batchEnd = batchPos + batchSize
+            StepProfiler.shared.begin("prefill", tokens: batchSize)
 
             if debugLevel >= 1 {
                 print("\nPrefill batch: \(batchPos) to \(batchEnd), full batch of \(batchSize)")
@@ -1649,6 +1651,7 @@ private typealias Float16 = Float
             for i in 0..<batchSize {
                 positionIds[i] = NSNumber(value: batchPos + i)
             }
+            StepProfiler.shared.mark("input_prep")
             
             // Create batch causal mask
             let batchCausalMask = try MLMultiArray(
@@ -1670,6 +1673,7 @@ private typealias Float16 = Float
                 }
             }
             
+            StepProfiler.shared.mark("mask_prep")
             // Run embeddings with prefill backing
             let embedInput = try MLDictionaryFeatureProvider(dictionary: ["input_ids": batchInput])
             let embedOptions = MLPredictionOptions()
@@ -1684,7 +1688,9 @@ private typealias Float16 = Float
             if debugLevel >= 1 {
                 print("About to run embedding model prediction...")
             }
+            StepProfiler.shared.mark("input_prep")
             let _ = try await embedModel.prediction(from: embedInput, options: embedOptions)
+            StepProfiler.shared.mark("embed_predict")
             await maybeDelayBeforeReadingPredictionOutputs()
             if debugLevel >= 1 {
                 print("Embedding model prediction completed successfully")
@@ -1771,6 +1777,7 @@ private typealias Float16 = Float
                     "current_pos": currentPosArray
                 ])
 
+                StepProfiler.shared.mark("input_prep")
                 // Use rotation function if available and batchPos >= slidingWindow
                 if useRotation, let prefillRotateModel = chunk.prefillRotateModel {
                     try runStatefulPredictionOnQueue(
@@ -1785,6 +1792,7 @@ private typealias Float16 = Float
                         options: ffnOptions
                     )
                 }
+                StepProfiler.shared.mark("ffn_predict")
                 await maybeDelayBeforeReadingPredictionOutputs()
 
                 guard let nextHiddenStates = selectedBackings?["output_hidden_states"] else {
@@ -1800,6 +1808,7 @@ private typealias Float16 = Float
                 }
             }
             
+            StepProfiler.shared.end()
             batchPos = batchEnd
         }
 
@@ -2263,6 +2272,8 @@ private typealias Float16 = Float
             )
         }
 
+        StepProfiler.shared.begin("decode", tokens: 1)
+        defer { StepProfiler.shared.end() }
         // Run embeddings with output backing
         let tokenArray = try MLMultiArray(shape: [1, 1], dataType: .int32)
         tokenArray[[0, 0] as [NSNumber]] = NSNumber(value: lastToken)
@@ -2273,7 +2284,9 @@ private typealias Float16 = Float
         if let backings = hiddenStatesBackings_emb {
             embedOptions.outputBackings = backings
         }
+        StepProfiler.shared.mark("input_prep")
         let _ = try await embedModel.prediction(from: embedInput, options: embedOptions)
+        StepProfiler.shared.mark("embed_predict")
         await maybeDelayBeforeReadingPredictionOutputs()
 
         // Get hidden states from embed backing
@@ -2293,7 +2306,9 @@ private typealias Float16 = Float
 
         // Get causal mask for single token - use safePos to match position_ids
         // At position N, we should see positions 0 to N (not 0 to N+1)
+        StepProfiler.shared.mark("input_prep")
         let causalMask = try getCausalMask(for: 1, at: safePos)
+        StepProfiler.shared.mark("mask_prep")
 
         // Create current_pos as tensor
         let currentPosArray = try MLMultiArray(shape: [1], dataType: .int32)
@@ -2327,6 +2342,7 @@ private typealias Float16 = Float
                 "current_pos": currentPosArray
             ])
 
+            StepProfiler.shared.mark("input_prep")
             // Use rotation function if available and position >= slidingWindow
             if useRotation, let inferRotateModel = chunk.inferRotateModel {
                 try runStatefulPredictionOnQueue(
@@ -2341,6 +2357,7 @@ private typealias Float16 = Float
                     options: ffnOptions
                 )
             }
+            StepProfiler.shared.mark("ffn_predict")
             await maybeDelayBeforeReadingPredictionOutputs()
 
             guard let nextHiddenStates = selectedBackings?["output_hidden_states"] ?? hiddenStatesBackings_ffn?["output_hidden_states"] else {
@@ -2363,8 +2380,12 @@ private typealias Float16 = Float
         }
 
         let lmInput = try MLDictionaryFeatureProvider(dictionary: ["hidden_states": currentHiddenStates])
+        StepProfiler.shared.mark("input_prep")
         let _ = try await lmheadModel.prediction(from: lmInput, options: lmOptions)
+        StepProfiler.shared.mark("lmhead_predict")
         await maybeDelayBeforeReadingPredictionOutputs()
+        StepProfiler.shared.mark("other")
+        defer { StepProfiler.shared.mark("argmax") }
         
         guard let outputBackings = lmheadOutputBackings else {
             throw InferenceError.inferenceError("Output backings not initialized")
